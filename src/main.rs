@@ -15,6 +15,27 @@ use serde::Deserialize;
 use log::info;
 use libc::{ioctl, TIOCSCTTY};
 use nix::unistd::{setsid, setpgid, Pid, dup, getsid, getpgrp};
+use structopt::StructOpt;
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "websocket-server", about = "A WebSocket server with PTY support.")]
+struct Opt {
+    /// Use HTTPS (wss://) instead of HTTP (ws://)
+    #[structopt(long)]
+    https: bool,
+
+    /// Host to bind the server to
+    #[structopt(long, default_value = "0.0.0.0")]
+    host: String,
+
+    /// Port to bind the server to
+    #[structopt(long, default_value = "8080")]
+    port: u16,
+
+    /// Command to run in the PTY (default: "bash -i")
+    #[structopt(long, default_value = "bash -i")]
+    cmd: String,
+}
 
 #[derive(Deserialize)]
 struct ResizeMessage {
@@ -24,6 +45,7 @@ struct ResizeMessage {
 
 async fn handle_websocket(
     stream: WebSocketStream<hyper::upgrade::Upgraded>,
+    cmd: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("WebSocket connection established");
     let (mut ws_sender, mut ws_receiver) = stream.split();
@@ -56,17 +78,20 @@ async fn handle_websocket(
         ioctl(pty.master.as_raw_fd(), TIOCSCTTY, 0);
     }
 
-    // Spawn an interactive shell.
-    let mut child = Command::new("bash")
-        .arg("-i")
-        .arg("-c")
-        .arg("python3 -c 'import pty; pty.spawn(\"/bin/bash\")'") // If I remove this, CTRL+C does not work, but resize works.
+    // Parse the command and its arguments.
+    let mut cmd_parts = cmd.split_whitespace();
+    let cmd_name = cmd_parts.next().unwrap_or("bash");
+    let cmd_args: Vec<&str> = cmd_parts.collect();
+
+    // Spawn the specified command.
+    let mut child = Command::new(cmd_name)
+        .args(cmd_args)
         .env("TERM", "xterm-256color")
         .stdin(unsafe { Stdio::from_raw_fd(slave_fd) })
         .stdout(unsafe { Stdio::from_raw_fd(slave_fd) })
         .stderr(unsafe { Stdio::from_raw_fd(slave_fd) })
         .spawn()?;
-    info!("Spawned shell process (PID: {})", child.id());
+    info!("Spawned command process (PID: {})", child.id());
 
     // Check if the process is already a session leader.
     if getsid(None).is_err() {
@@ -125,10 +150,8 @@ async fn handle_websocket(
     // Task: forward data (or resize commands) from WebSocket to PTY.
     let ws_to_pty = async move {
         while let Some(msg) = ws_receiver.next().await {
-            info!("Received WebSocket message");
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                    info!("Received text message (possibly resize): {}", text);
                     if let Ok(resize) = serde_json::from_str::<ResizeMessage>(&text) {
                         let winsize = libc::winsize {
                             ws_row: resize.rows,
@@ -139,24 +162,22 @@ async fn handle_websocket(
                         unsafe {
                             libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize);
                         }
-                        // let cmd = format!("stty rows {} columns {}\n", resize.rows, resize.cols);
-                        // if let Err(e) = pty_writer.write_all(cmd.as_bytes()).await {
-                        //     eprintln!("PTY write error: {}", e);
-                        //     break;
-                        // }
-                        // $ stty rows 38 columns 116
                         info!("Terminal resized to {}x{}", resize.cols, resize.rows);
                     }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
-                    info!("Writing {} bytes to PTY: {:?}", data.len(), data);
-                    if let Err(e) = pty_writer.write_all(&data).await {
-                        eprintln!("PTY write error: {}", e);
-                        break;
-                    }
-                    if let Err(e) = pty_writer.flush().await {
-                        eprintln!("PTY flush error: {}", e);
-                        break;
+                    let filtered_data: Vec<u8> = data.into_iter().filter(|&b| b != 0x04).collect();
+                
+                    if !filtered_data.is_empty() {
+                        info!("Writing {} bytes to PTY: {:?}", filtered_data.len(), filtered_data);
+                        if let Err(e) = pty_writer.write_all(&filtered_data).await {
+                            eprintln!("PTY write error: {}", e);
+                            break;
+                        }
+                        if let Err(e) = pty_writer.flush().await {
+                            eprintln!("PTY flush error: {}", e);
+                            break;
+                        }
                     }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
@@ -181,7 +202,7 @@ async fn handle_websocket(
     Ok(())
 }
 
-async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<Response<Body>, Infallible> {
     info!("Received request: {} {}", req.method(), req.uri().path());
 
     if req.uri().path() == "/ws" {
@@ -227,7 +248,7 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
                 Ok(upgraded) => {
                     info!("Connection upgraded");
                     let ws_stream = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
-                    if let Err(e) = handle_websocket(ws_stream).await {
+                    if let Err(e) = handle_websocket(ws_stream, cmd).await {
                         eprintln!("WebSocket handling error: {}", e);
                     }
                 }
@@ -243,70 +264,95 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
             .unwrap());
     } else {
         info!("Serving HTML page");
-        let html = r#"
+        let ws_protocol = if https { "wss" } else { "ws" };
+        let html = format!(r#"
         <!DOCTYPE html>
         <html>
         <head>
+            <link
+        	    rel="iframely"
+                type="text/html"
+	            media="(aspect-ratio: 1280/720)"
+            />
             <link rel="stylesheet" href="https://unpkg.com/xterm@5.1.0/css/xterm.css">
             <script src="https://unpkg.com/xterm@5.1.0/lib/xterm.js"></script>
             <script src="https://unpkg.com/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
         </head>
         <body>
+            <style>
+                html, div, body {{
+                    padding: 0;
+                    margin: 0;
+                }}
+            </style>
             <div id="terminal" style="height: 100vh;"></div>
             <script>
-                const term = new Terminal({
+                const term = new Terminal({{
                     cursorBlink: true,
                     fontFamily: 'monospace',
                     fontSize: 14,
-                    theme: { background: '#1e1e1e', foreground: '#ffffff' },
+                    theme: {{ background: '#111314', foreground: '#ffffff' }},
                     convertEol: true, // Convert \n to \r\n
-                });
+                }});
                 const fitAddon = new FitAddon.FitAddon();
                 term.loadAddon(fitAddon);
                 let ws = null;
-                function connect() {
+                let interval;
+
+                function connect() {{
                     console.log('Connecting to WebSocket...');
-                    ws = new WebSocket('ws://' + window.location.host + '/ws');
+                    ws = new WebSocket('{}://' + window.location.host + '/ws');
                     ws.binaryType = "arraybuffer"; // Ensure binary messages are ArrayBuffers.
-                    ws.onopen = () => {
+                    ws.onopen = () => {{
                         console.log('WebSocket connected');
                         term.reset();
                         fitAddon.fit();
                         term.focus();
-                        ws.send(JSON.stringify({ cols, rows }));
+                        // ws.send(JSON.stringify({{ cols, rows }}));
+                        interval = setInterval(() => ws.send(''), 300)
 
-                    };
-                    ws.onerror = (error) => {
+
+                    }};
+                    ws.onerror = (error) => {{
                         console.error('WebSocket error:', error);
-                    };
-                    ws.onclose = () => {
+                    }};
+                    ws.onclose = () => {{
                         console.log('WebSocket closed');
-                    };
-                    ws.onmessage = (event) => {
+                    }};
+                    ws.onmessage = (event) => {{
                         let text;
-                        if (typeof event.data === "string") {
+                        if (typeof event.data === "string") {{
                             text = event.data;
-                        } else {
+                        }} else {{
                             text = new TextDecoder("utf-8").decode(event.data);
-                        }
+                        }}
                         term.write(text);
-                    };
-                }
-                term.onData(data => {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
+                    }};
+                }}
+                term.onData(data => {{
+                    if (ws && ws.readyState === WebSocket.OPEN) {{
                         // Handle CTRL+C (0x03) and CTRL+D (0x04)
-                        if (data === "\x03" || data === "\x04") {
+                        if (data === "\x03" || data === "\x04") {{
                             ws.send(new TextEncoder().encode(data));
-                        } else {
+                        }} else {{
                             ws.send(new TextEncoder().encode(data));
-                        }
-                    }
-                });
-                term.onResize(({ cols, rows }) => {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ cols, rows }));
-                    }
-                });
+                        }}
+                    }}
+                }});
+                term.onResize(({{ cols, rows }}) => {{
+                    if (ws && ws.readyState === WebSocket.OPEN) {{
+                        ws.send(JSON.stringify({{ cols, rows }}));
+                    }}
+                }});
+                function resize() {{
+                    setTimeout(() => {{
+                        if (ws && ws.readyState === WebSocket.OPEN) {{
+                            ws.send(new TextEncoder().encode("resize\n"));
+                        }}
+                    }}, 200)
+                }}
+
+
                 term.open(document.getElementById('terminal'));
                 fitAddon.fit();
                 connect();
@@ -314,7 +360,7 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
             </script>
         </body>
         </html>
-        "#;
+        "#, ws_protocol);
         return Ok(Response::new(Body::from(html)));
     }
 }
@@ -323,12 +369,18 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let addr = ([0, 0, 0, 0], 8080).into();
-    let service = make_service_fn(|_conn: &AddrStream| async {
-        Ok::<_, Infallible>(service_fn(handle_request))
+    let opt = Opt::from_args();
+
+    let addr = format!("{}:{}", opt.host, opt.port).parse()?;
+    let service = make_service_fn(|_conn: &AddrStream| {
+        let https = opt.https;
+        let cmd = opt.cmd.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| handle_request(req, https, cmd.clone())))
+        }
     });
 
-    info!("Server starting on http://{}", addr);
+    info!("Server starting on {}://{}", if opt.https { "https" } else { "http" }, addr);
     Server::bind(&addr).serve(service).await?;
     Ok(())
 }
