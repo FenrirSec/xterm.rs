@@ -8,14 +8,15 @@ use nix::pty::openpty;
 use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, cfmakeraw};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::process::{Command, Stdio};
+use std::process::{Stdio};
+use tokio::process::Command;
 use std::convert::Infallible;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde::Deserialize;
 use log::info;
-use libc::{ioctl, TIOCSCTTY};
-use nix::unistd::{setsid, setpgid, Pid, dup, getsid, getpgrp};
+use nix::unistd::{setsid, dup, getsid};
 use structopt::StructOpt;
+use tokio::sync::broadcast;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "websocket-server", about = "A WebSocket server with PTY support.")]
@@ -35,6 +36,10 @@ struct Opt {
     /// Command to run in the PTY (default: "bash -i")
     #[structopt(long, default_value = "bash -i")]
     cmd: String,
+
+    /// Exit the program when the PTY process closes or when CTRL+D is received
+    #[structopt(long)]
+    exit_with_process: bool,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +51,8 @@ struct ResizeMessage {
 async fn handle_websocket(
     stream: WebSocketStream<hyper::upgrade::Upgraded>,
     cmd: String,
+    exit_with_process: bool,
+    shutdown_sender: Option<broadcast::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("WebSocket connection established");
     let (mut ws_sender, mut ws_receiver) = stream.split();
@@ -73,38 +80,43 @@ async fn handle_websocket(
     let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
     fcntl(master_fd, FcntlArg::F_SETFL(new_flags))?;
 
-    // Make the PTY the controlling terminal for the shell.
-    unsafe {
-        ioctl(pty.master.as_raw_fd(), TIOCSCTTY, 0);
-    }
-
     // Parse the command and its arguments.
     let mut cmd_parts = cmd.split_whitespace();
     let cmd_name = cmd_parts.next().unwrap_or("bash");
     let cmd_args: Vec<&str> = cmd_parts.collect();
 
     // Spawn the specified command.
-    let mut child = Command::new(cmd_name)
+    let slave_stdin = unsafe { Stdio::from_raw_fd(slave_fd) };
+    let slave_stdout = unsafe { Stdio::from_raw_fd(slave_fd) };
+    let slave_stderr = unsafe { Stdio::from_raw_fd(slave_fd) };
+
+    let child = Command::new(cmd_name)
         .args(cmd_args)
         .env("TERM", "xterm-256color")
-        .stdin(unsafe { Stdio::from_raw_fd(slave_fd) })
-        .stdout(unsafe { Stdio::from_raw_fd(slave_fd) })
-        .stderr(unsafe { Stdio::from_raw_fd(slave_fd) })
+        .stdin(slave_stdin)
+        .stdout(slave_stdout)
+        .stderr(slave_stderr)
         .spawn()?;
-    info!("Spawned command process (PID: {})", child.id());
+
+
+        let child_pid = child.id()
+        .expect("Child process should have a PID") as i32;  // Convert u32 to i32
+
+    if exit_with_process {
+        if let Some(sender) = &shutdown_sender {
+            let sender = sender.clone();
+            let mut child = child;
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+                let _ = sender.send(());
+            });
+        }
+    }
 
     // Check if the process is already a session leader.
     if getsid(None).is_err() {
         if let Err(e) = setsid() {
             eprintln!("Failed to set session leader: {}", e);
-            return Err(Box::new(e));
-        }
-    }
-
-    // Check if the process is already in its own process group.
-    if getpgrp() != Pid::from_raw(0) {
-        if let Err(e) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
-            eprintln!("Failed to set process group: {}", e);
             return Err(Box::new(e));
         }
     }
@@ -166,8 +178,19 @@ async fn handle_websocket(
                     }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
-                    let filtered_data: Vec<u8> = data.into_iter().filter(|&b| b != 0x04).collect();
-                
+                    if exit_with_process && data.contains(&0x04) {
+                        if let Some(sender) = &shutdown_sender {
+                            let _ = sender.send(());
+                        }
+                        break;
+                    }
+
+                    let filtered_data: Vec<u8> = if exit_with_process {
+                        data
+                    } else {
+                        data.into_iter().filter(|&b| b != 0x04).collect()
+                    };
+
                     if !filtered_data.is_empty() {
                         info!("Writing {} bytes to PTY: {:?}", filtered_data.len(), filtered_data);
                         if let Err(e) = pty_writer.write_all(&filtered_data).await {
@@ -198,17 +221,25 @@ async fn handle_websocket(
     };
 
     info!("Closing connection");
-    let _ = child.kill();
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
     Ok(())
 }
 
-async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<Response<Body>, Infallible> {
+async fn handle_request(
+    req: Request<Body>,
+    https: bool,
+    cmd: String,
+    exit_with_process: bool,
+    shutdown_sender: Option<broadcast::Sender<()>>,
+) -> Result<Response<Body>, Infallible> {
     info!("Received request: {} {}", req.method(), req.uri().path());
 
     if req.uri().path() == "/ws" {
         info!("WebSocket upgrade requested");
 
-        // Ensure proper upgrade headers.
         if req.headers().get("upgrade")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_lowercase()) != Some("websocket".to_string()) {
@@ -218,11 +249,9 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
                 .unwrap());
         }
 
-        // Get Sec-WebSocket-Key.
         let key = match req.headers().get("sec-websocket-key") {
             Some(k) => k.to_str().unwrap_or(""),
             None => {
-                eprintln!("Missing Sec-WebSocket-Key header");
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Body::from("Missing Sec-WebSocket-Key"))
@@ -230,10 +259,8 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
             }
         };
 
-        // Compute accept key.
         let accept_key = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
 
-        // Build the 101 Switching Protocols response.
         let response = Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .header("Connection", "Upgrade")
@@ -242,13 +269,12 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
             .body(Body::empty())
             .unwrap();
 
-        // Spawn the upgrade task, consuming the request.
         tokio::spawn(async move {
             match upgrade::on(req).await {
                 Ok(upgraded) => {
                     info!("Connection upgraded");
                     let ws_stream = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
-                    if let Err(e) = handle_websocket(ws_stream, cmd).await {
+                    if let Err(e) = handle_websocket(ws_stream, cmd, exit_with_process, shutdown_sender).await {
                         eprintln!("WebSocket handling error: {}", e);
                     }
                 }
@@ -263,17 +289,11 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
             .body(Body::empty())
             .unwrap());
     } else {
-        info!("Serving HTML page");
         let ws_protocol = if https { "wss" } else { "ws" };
         let html = format!(r#"
         <!DOCTYPE html>
         <html>
         <head>
-            <link
-        	    rel="iframely"
-                type="text/html"
-	            media="(aspect-ratio: 1280/720)"
-            />
             <link rel="stylesheet" href="https://unpkg.com/xterm@5.1.0/css/xterm.css">
             <script src="https://unpkg.com/xterm@5.1.0/lib/xterm.js"></script>
             <script src="https://unpkg.com/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
@@ -292,7 +312,7 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
                     fontFamily: 'monospace',
                     fontSize: 14,
                     theme: {{ background: '#111314', foreground: '#ffffff' }},
-                    convertEol: true, // Convert \n to \r\n
+                    convertEol: true,
                 }});
                 const fitAddon = new FitAddon.FitAddon();
                 term.loadAddon(fitAddon);
@@ -301,17 +321,15 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
 
                 function connect() {{
                     console.log('Connecting to WebSocket...');
-                    ws = new WebSocket('{}://' + window.location.host + '/ws');
-                    ws.binaryType = "arraybuffer"; // Ensure binary messages are ArrayBuffers.
+                    ws = new WebSocket('{}://' + window.location.host + window.location.pathname.replace('term', 'ws'));
+                    window.ws = ws;
+                    ws.binaryType = "arraybuffer";
                     ws.onopen = () => {{
                         console.log('WebSocket connected');
                         term.reset();
                         fitAddon.fit();
                         term.focus();
-                        // ws.send(JSON.stringify({{ cols, rows }}));
                         interval = setInterval(() => ws.send(''), 300)
-
-
                     }};
                     ws.onerror = (error) => {{
                         console.error('WebSocket error:', error);
@@ -331,7 +349,6 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
                 }}
                 term.onData(data => {{
                     if (ws && ws.readyState === WebSocket.OPEN) {{
-                        // Handle CTRL+C (0x03) and CTRL+D (0x04)
                         if (data === "\x03" || data === "\x04") {{
                             ws.send(new TextEncoder().encode(data));
                         }} else {{
@@ -352,7 +369,6 @@ async fn handle_request(req: Request<Body>, https: bool, cmd: String) -> Result<
                     }}, 200)
                 }}
 
-
                 term.open(document.getElementById('terminal'));
                 fitAddon.fit();
                 connect();
@@ -371,16 +387,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let opt = Opt::from_args();
 
+    let (shutdown_sender, _) = broadcast::channel(1);
+
     let addr = format!("{}:{}", opt.host, opt.port).parse()?;
     let service = make_service_fn(|_conn: &AddrStream| {
         let https = opt.https;
         let cmd = opt.cmd.clone();
+        let exit_with_process = opt.exit_with_process;
+        let shutdown_sender = if exit_with_process {
+            Some(shutdown_sender.clone())
+        } else {
+            None
+        };
         async move {
-            Ok::<_, Infallible>(service_fn(move |req| handle_request(req, https, cmd.clone())))
+            Ok::<_, Infallible>(service_fn(move |req| {
+                handle_request(req, https, cmd.clone(), exit_with_process, shutdown_sender.clone())
+            }))
         }
     });
 
     info!("Server starting on {}://{}", if opt.https { "https" } else { "http" }, addr);
-    Server::bind(&addr).serve(service).await?;
+    let server = Server::bind(&addr).serve(service);
+
+    let graceful = server.with_graceful_shutdown(async {
+        let _ = shutdown_sender.subscribe().recv().await;
+        info!("Received shutdown signal, shutting down server.");
+    });
+
+    graceful.await?;
     Ok(())
 }
