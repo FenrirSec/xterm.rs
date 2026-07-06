@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xterm.rs — a real terminal in the browser · fenrir.pro</title>
+<meta name="description" content="xterm.rs is a tiny Rust backend that streams a real PTY over WebSocket. Job control, signals, full-screen TUIs and live resize — the things web terminals usually fake. Built in-house at fenrir.pro.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0A0D12;
+    --bg-2:#0F141C;
+    --panel:#121925;
+    --panel-2:#0C1119;
+    --line:#1E2A3A;
+    --line-soft:#161F2B;
+    --ink:#DCE3ED;
+    --ink-dim:#8A97A8;
+    --ink-faint:#5A6575;
+    --moon:#8FB7E0;
+    --moon-bright:#C2DAF5;
+    --ember:#E9933B;
+    --ember-soft:rgba(233,147,59,.14);
+    --ok:#7FCFA0;
+    --maxw:1180px;
+    --radius:14px;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --disp:'Chakra Petch',system-ui,sans-serif;
+    --body:'Inter',system-ui,sans-serif;
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--body);
+    font-size:17px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  /* moonlight ambient, cool, top-right */
+  body::before{
+    content:"";
+    position:fixed;inset:0;z-index:-1;
+    background:
+      radial-gradient(820px 520px at 88% -8%, rgba(143,183,224,.14), transparent 60%),
+      radial-gradient(680px 480px at 8% 108%, rgba(233,147,59,.06), transparent 60%);
+    pointer-events:none;
+  }
+  a{color:var(--moon);text-decoration:none}
+  a:hover{color:var(--moon-bright)}
+  h1,h2,h3{font-family:var(--disp);font-weight:600;line-height:1.08;letter-spacing:-.01em;margin:0}
+  p{margin:0}
+
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+  .eyebrow{
+    font-family:var(--mono);font-size:.72rem;font-weight:500;
+    text-transform:uppercase;letter-spacing:.26em;color:var(--moon);
+    display:inline-flex;align-items:center;gap:.6em;
+  }
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--moon);opacity:.6}
+
+  /* ---------- top bar ---------- */
+  header{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:blur(10px);
+    background:rgba(10,13,18,.72);
+    border-bottom:1px solid var(--line-soft);
+  }
+  .nav{display:flex;align-items:center;justify-content:space-between;height:64px}
+  .brand{display:flex;align-items:center;gap:.6rem;font-family:var(--disp);font-weight:700;letter-spacing:.02em;color:var(--ink)}
+  .brand .glyph{color:var(--ember)}
+  .brand small{font-family:var(--mono);font-weight:400;font-size:.7rem;color:var(--ink-faint);letter-spacing:.12em;margin-left:.1rem}
+  .nav-links{display:flex;gap:1.6rem;align-items:center;font-size:.92rem}
+  .nav-links a{color:var(--ink-dim)}
+  .nav-links a:hover{color:var(--ink)}
+  .nav-cta{
+    font-family:var(--mono);font-size:.82rem;color:var(--ink)!important;
+    border:1px solid var(--line);border-radius:8px;padding:.42rem .8rem;
+  }
+  .nav-cta:hover{border-color:var(--moon);background:rgba(143,183,224,.07)}
+
+  /* ---------- buttons ---------- */
+  .btn{
+    display:inline-flex;align-items:center;gap:.55rem;
+    font-family:var(--mono);font-size:.9rem;font-weight:500;
+    padding:.78rem 1.25rem;border-radius:10px;border:1px solid transparent;
+    cursor:pointer;transition:transform .12s ease,background .15s ease,border-color .15s ease;
+  }
+  .btn-primary{background:var(--ember);color:#1a1206;border-color:var(--ember)}
+  .btn-primary:hover{transform:translateY(-1px);background:#f4a64d;color:#160f04}
+  .btn-ghost{border-color:var(--line);color:var(--ink)}
+  .btn-ghost:hover{border-color:var(--moon);background:rgba(143,183,224,.07);color:var(--moon-bright)}
+
+  /* ---------- hero ---------- */
+  .hero{padding:72px 0 40px}
+  .hero-grid{display:grid;grid-template-columns:minmax(0,1.02fr) minmax(0,1.18fr);gap:54px;align-items:center}
+  .hero h1{font-size:clamp(2.5rem,5.4vw,4.15rem);margin:.7rem 0 0}
+  .hero h1 .un{position:relative;color:var(--ink)}
+  .hero h1 .un::after{
+    content:"";position:absolute;left:0;right:0;bottom:.07em;height:.14em;
+    background:linear-gradient(90deg,var(--ember),transparent);border-radius:2px;
+  }
+  .hero .lede{color:var(--ink-dim);font-size:1.12rem;margin-top:1.25rem;max-width:34em}
+  .hero .lede b{color:var(--ink);font-weight:600}
+  .hero-actions{display:flex;gap:.8rem;flex-wrap:wrap;margin-top:1.8rem}
+  .hint{font-family:var(--mono);font-size:.78rem;color:var(--ink-faint);margin-top:1.4rem;display:flex;align-items:center;gap:.5rem}
+  .dot-live{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(127,207,160,.5);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(127,207,160,.45)}70%{box-shadow:0 0 0 7px rgba(127,207,160,0)}100%{box-shadow:0 0 0 0 rgba(127,207,160,0)}}
+
+  /* ---------- terminal frame (the signature) ---------- */
+  .term{
+    background:var(--panel-2);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    overflow:hidden;
+    box-shadow:0 30px 80px -40px rgba(0,0,0,.9),0 0 0 1px rgba(143,183,224,.04) inset;
+  }
+  .term-bar{
+    display:flex;align-items:center;gap:.7rem;
+    padding:.6rem .9rem;background:linear-gradient(180deg,#141d29,#0f1620);
+    border-bottom:1px solid var(--line);
+  }
+  .lights{display:flex;gap:.42rem}
+  .lights i{width:11px;height:11px;border-radius:50%;display:block;opacity:.9}
+  .lights i:nth-child(1){background:#e06c75}
+  .lights i:nth-child(2){background:#e5c07b}
+  .lights i:nth-child(3){background:#98c379}
+  .term-title{font-family:var(--mono);font-size:.78rem;color:var(--ink-dim);letter-spacing:.02em}
+  .term-title b{color:var(--ember);font-weight:500}
+  .term-body{position:relative;background:#111314}
+  .term-body iframe{display:block;width:100%;height:100%;border:0;background:#111314}
+  .hero .term-body{height:430px}
+  .term-foot{
+    font-family:var(--mono);font-size:.74rem;color:var(--ink-faint);
+    padding:.55rem .9rem;border-top:1px solid var(--line-soft);background:var(--panel-2);
+  }
+  /* offline notice that sits behind the iframe; if the iframe loads it covers this */
+  .term-fallback{
+    position:absolute;inset:0;display:flex;flex-direction:column;gap:.6rem;
+    align-items:center;justify-content:center;text-align:center;padding:1.5rem;
+    font-family:var(--mono);font-size:.8rem;color:var(--ink-faint);background:#111314;
+  }
+  .term-fallback code{color:var(--moon);background:rgba(143,183,224,.08);padding:.15em .45em;border-radius:5px}
+
+  /* ---------- section scaffolding ---------- */
+  section{padding:84px 0}
+  .sec-head{max-width:42rem}
+  .sec-head h2{font-size:clamp(1.7rem,3vw,2.4rem);margin-top:.7rem}
+  .sec-head p{color:var(--ink-dim);margin-top:.9rem}
+
+  /* ---------- fake vs real ---------- */
+  .vs{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:42px}
+  .vs-card{border:1px solid var(--line);border-radius:var(--radius);padding:26px 26px 8px;background:var(--panel)}
+  .vs-card.fake{background:var(--panel-2);border-style:dashed;border-color:var(--line-soft)}
+  .vs-card h3{font-family:var(--mono);font-size:.82rem;font-weight:500;text-transform:uppercase;letter-spacing:.18em}
+  .vs-card.fake h3{color:var(--ink-faint)}
+  .vs-card.real h3{color:var(--ember)}
+  .vs-card ul{list-style:none;padding:0;margin:18px 0 18px}
+  .vs-card li{display:flex;gap:.7rem;padding:.5rem 0;border-top:1px solid var(--line-soft);font-size:.96rem;color:var(--ink-dim)}
+  .vs-card li:first-child{border-top:0}
+  .vs-card.real li{color:var(--ink)}
+  .mk{flex:none;width:1.1rem;font-family:var(--mono);font-weight:700}
+  .mk.x{color:var(--ink-faint)}
+  .mk.y{color:var(--ok)}
+
+  /* ---------- features ---------- */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);border:1px solid var(--line-soft);border-radius:var(--radius);overflow:hidden;margin-top:44px}
+  .cell{background:var(--bg-2);padding:30px 26px;transition:background .18s ease}
+  .cell:hover{background:var(--panel)}
+  .cell .num{font-family:var(--mono);font-size:.72rem;color:var(--ember);letter-spacing:.1em}
+  .cell h3{font-family:var(--disp);font-size:1.18rem;margin:.65rem 0 .5rem;color:var(--ink)}
+  .cell p{font-size:.94rem;color:var(--ink-dim)}
+  .cell code{font-family:var(--mono);font-size:.86em;color:var(--moon-bright)}
+
+  /* ---------- live demos ---------- */
+  .tabs{display:flex;gap:.5rem;margin-top:38px;flex-wrap:wrap}
+  .tab{
+    font-family:var(--mono);font-size:.86rem;color:var(--ink-dim);
+    padding:.6rem 1.05rem;border:1px solid var(--line);border-radius:9px;
+    background:transparent;cursor:pointer;transition:all .15s ease;
+  }
+  .tab .k{color:var(--ink-faint);margin-right:.5rem}
+  .tab[aria-selected="true"]{color:var(--ink);border-color:var(--moon);background:rgba(143,183,224,.08)}
+  .tab[aria-selected="true"] .k{color:var(--moon)}
+  .demo-stage{margin-top:18px}
+  .demo-stage .term-body{height:520px}
+  .demo-cap{display:none;color:var(--ink-dim);font-size:.96rem;margin-top:18px;max-width:46em}
+  .demo-cap.active{display:block}
+  .demo-cap kbd{font-family:var(--mono);font-size:.82em;background:var(--panel);border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:.1em .4em;color:var(--ink)}
+
+  /* ---------- promo bands ---------- */
+  .band{border-top:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft)}
+  .band.courses{background:linear-gradient(180deg,rgba(143,183,224,.05),transparent)}
+  .band.fenrir{background:linear-gradient(180deg,rgba(233,147,59,.05),transparent)}
+  .band-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:40px;align-items:center}
+  .band h2{font-size:clamp(1.6rem,2.8vw,2.2rem)}
+  .band p{color:var(--ink-dim);margin-top:1rem;max-width:38em}
+  .band .aside{justify-self:end;text-align:right}
+  .band .aside .btn{margin-bottom:.7rem}
+  .band .meta{font-family:var(--mono);font-size:.78rem;color:var(--ink-faint)}
+
+  /* a quiet broken-chain mark — the one piece of iconography */
+  .chain{display:block;margin:0 auto 6px;width:46px;height:46px;color:var(--ember);opacity:.85}
+
+  /* ---------- footer ---------- */
+  footer{padding:54px 0 64px;border-top:1px solid var(--line-soft);color:var(--ink-faint)}
+  .foot-grid{display:flex;justify-content:space-between;align-items:flex-start;gap:30px;flex-wrap:wrap}
+  .foot-links{display:flex;gap:1.6rem;font-family:var(--mono);font-size:.86rem}
+  .foot-note{font-family:var(--mono);font-size:.74rem;max-width:30em;line-height:1.5}
+
+  /* ---------- motion / reveal ---------- */
+  .reveal{opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.in{opacity:1;transform:none}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:900px){
+    .hero-grid{grid-template-columns:1fr;gap:34px}
+    .hero{padding:48px 0 24px}
+    .vs,.band-grid{grid-template-columns:1fr}
+    .grid{grid-template-columns:1fr 1fr}
+    .band .aside{justify-self:start;text-align:left}
+    .nav-links a:not(.nav-cta){display:none}
+  }
+  @media (max-width:560px){
+    body{font-size:16px}
+    .grid{grid-template-columns:1fr}
+    .hero .term-body{height:340px}
+    .demo-stage .term-body{height:420px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;scroll-behavior:auto}
+    .reveal{opacity:1;transform:none;transition:none}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#top">fenrir<span class="glyph">.</span>pro <small>// xterm.rs</small></a>
+    <nav class="nav-links">
+      <a href="#why">Why</a>
+      <a href="#features">Features</a>
+      <a href="#demos">Live demos</a>
+      <a href="https://hack.courses" target="_blank" rel="noopener">hack.courses ↗</a>
+      <a class="nav-cta" href="https://fenrir.pro/contact" target="_blank" rel="noopener">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<a id="top"></a>
+
+<!-- ================= HERO ================= -->
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div class="reveal in">
+      <span class="eyebrow">Terminal backend · Rust</span>
+      <h1>The browser terminal that <span class="un">doesn't fake it</span>.</h1>
+      <p class="lede">
+        <b>xterm.rs</b> is a tiny Rust backend that streams a <b>real PTY</b> over a
+        WebSocket. Job control, Unix signals, full-screen TUIs and live resize —
+        the things web terminals usually only pretend to do. The window on the
+        right is an actual shell. Go on.
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#demos">Open the live shell ↓</a>
+        <a class="btn btn-ghost" href="#why">How it works</a>
+      </div>
+      <p class="hint"><span class="dot-live"></span> Throwaway sandbox · click inside and type</p>
+    </div>
+
+    <div class="term reveal in" style="transition-delay:.1s">
+      <div class="term-bar">
+        <span class="lights"><i></i><i></i><i></i></span>
+        <span class="term-title"><b>demo@fenrir</b>:~ — bash · live over xterm.rs</span>
+      </div>
+      <div class="term-body">
+        <div class="term-fallback">
+          <div>shell back-end not reachable</div>
+          <div>start it with <code>docker compose up</code>, then refresh</div>
+        </div>
+        <iframe data-term="shell" title="Live interactive shell" allow="clipboard-read; clipboard-write"></iframe>
+      </div>
+      <div class="term-foot">try: <span style="color:var(--moon-bright)">ls -la</span> · <span style="color:var(--moon-bright)">uname -a</span> · run <span style="color:var(--moon-bright)">sleep 30</span> and cancel it with Ctrl-C</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= WHY ================= -->
+<section id="why">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="eyebrow">The difference</span>
+      <h2>Most "web terminals" are a transcript. This is a process.</h2>
+      <p>
+        A lot of in-browser terminals match your input against a script and print
+        canned output. It looks right until you press <kbd>Ctrl-C</kbd> or open an
+        editor. xterm.rs spawns a genuine shell on a PTY with a controlling
+        terminal, so the kernel — not a lookup table — decides what happens.
+      </p>
+    </div>
+
+    <div class="vs">
+      <div class="vs-card fake reveal">
+        <h3>Faked terminal</h3>
+        <ul>
+          <li><span class="mk x">×</span> Output matched from a fixed command list</li>
+          <li><span class="mk x">×</span> Ctrl-C does nothing — no signals</li>
+          <li><span class="mk x">×</span> vim, htop, tmux can't render</li>
+          <li><span class="mk x">×</span> Resizing the window changes nothing</li>
+          <li><span class="mk x">×</span> No job control, no <code style="color:var(--ink-faint)">/dev/tty</code></li>
+        </ul>
+      </div>
+      <div class="vs-card real reveal" style="transition-delay:.08s">
+        <h3>xterm.rs</h3>
+        <ul>
+          <li><span class="mk y">✓</span> A real <code>bash</code> on a real PTY</li>
+          <li><span class="mk y">✓</span> Ctrl-C / Ctrl-Z deliver SIGINT / SIGTSTP</li>
+          <li><span class="mk y">✓</span> Full-screen TUIs just work</li>
+          <li><span class="mk y">✓</span> Window resize fires a real SIGWINCH</li>
+          <li><span class="mk y">✓</span> Session leader with a controlling terminal</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FEATURES ================= -->
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="eyebrow">What you get</span>
+      <h2>Small surface, real terminal.</h2>
+      <p>One static binary, an <code>xterm.js</code> frontend, and a WebSocket between them. That's the whole stack.</p>
+    </div>
+    <div class="grid">
+      <div class="cell reveal"><div class="num">01</div><h3>Real PTY</h3><p>Each connection gets its own pseudo-terminal, set up as a session leader with the slave as its controlling terminal.</p></div>
+      <div class="cell reveal" style="transition-delay:.04s"><div class="num">02</div><h3>Signals &amp; job control</h3><p>Ctrl-C, Ctrl-Z, background jobs, <code>fg</code>, <code>tcsetpgrp</code> — the line discipline is the kernel's, not a polyfill.</p></div>
+      <div class="cell reveal" style="transition-delay:.08s"><div class="num">03</div><h3>Full-screen TUIs</h3><p>vim, htop, tmux, less, nano — anything cursor-addressed renders byte-for-byte the same as a native term.</p></div>
+      <div class="cell reveal"><div class="num">04</div><h3>Live resize</h3><p>The frontend reports cols and rows; the backend issues <code>TIOCSWINSZ</code> and the process gets a SIGWINCH.</p></div>
+      <div class="cell reveal" style="transition-delay:.04s"><div class="num">05</div><h3>Run any command</h3><p>Point <code>--cmd</code> at a shell, a single program, or your own lesson launcher. Optionally exit when it does.</p></div>
+      <div class="cell reveal" style="transition-delay:.08s"><div class="num">06</div><h3>Tiny Rust footprint</h3><p>Async hyper + tokio, no heavyweight framework. Drops cleanly into a container and gets out of the way.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= LIVE DEMOS ================= -->
+<section id="demos">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="eyebrow">Live, right here</span>
+      <h2>Three terminals you can actually use.</h2>
+      <p>Each tab is a separate xterm.rs back-end running one program in a locked-down container. Pick one and start typing.</p>
+    </div>
+
+    <div class="tabs reveal" role="tablist" aria-label="Live terminal demos">
+      <button class="tab" role="tab" aria-selected="true"  data-demo="shell" id="tab-shell"><span class="k">$</span>Interactive shell</button>
+      <button class="tab" role="tab" aria-selected="false" data-demo="htop"  id="tab-htop"><span class="k">▤</span>htop</button>
+      <button class="tab" role="tab" aria-selected="false" data-demo="vim"   id="tab-vim"><span class="k">✎</span>vim</button>
+    </div>
+
+    <div class="term demo-stage reveal" style="transition-delay:.06s">
+      <div class="term-bar">
+        <span class="lights"><i></i><i></i><i></i></span>
+        <span class="term-title" id="demo-title"><b>demo@fenrir</b>:~ — bash</span>
+      </div>
+      <div class="term-body">
+        <div class="term-fallback">
+          <div>this back-end isn't reachable yet</div>
+          <div>run <code>docker compose up</code> from the project root, then refresh</div>
+        </div>
+        <iframe id="demo-frame" title="Live terminal demo" allow="clipboard-read; clipboard-write"></iframe>
+      </div>
+      <div class="term-foot" id="demo-foot">a real bash shell — your keystrokes hit the process directly</div>
+    </div>
+
+    <p class="demo-cap active" data-cap="shell">A plain interactive <code style="font-family:var(--mono)">bash</code>. Pipe commands, start a long job and stop it with <kbd>Ctrl-C</kbd>, or launch <kbd>vim</kbd> from inside it — it's a full shell, not a sandboxed subset.</p>
+    <p class="demo-cap" data-cap="htop"><code style="font-family:var(--mono)">htop</code> repaints continuously and reads your keys live. Now drag this browser window to a new size: the layout reflows because the process received a real SIGWINCH.</p>
+    <p class="demo-cap" data-cap="vim"><code style="font-family:var(--mono)">vim</code> on a welcome file. Move with <kbd>hjkl</kbd>, press <kbd>i</kbd> to edit, <kbd>Esc</kbd> then <kbd>:q!</kbd> to quit. A cursor-addressed editor only works because the shell underneath owns a controlling terminal.</p>
+  </div>
+</section>
+
+<!-- ================= HACK.COURSES BAND ================= -->
+<section class="band courses">
+  <div class="wrap band-grid">
+    <div class="reveal">
+      <span class="eyebrow">Built to teach</span>
+      <h2>hack.courses runs on it.</h2>
+      <p>
+        Every IT and ethical-hacking lab on <a href="https://hack.courses" target="_blank" rel="noopener">hack.courses</a>
+        is a real machine in a browser tab, powered by xterm.rs. No VMs to install,
+        nothing to configure — learners land in a working terminal and start
+        breaking (and fixing) things from the first minute.
+      </p>
+    </div>
+    <div class="aside reveal" style="transition-delay:.08s">
+      <a class="btn btn-ghost" href="https://hack.courses" target="_blank" rel="noopener">Explore hack.courses ↗</a>
+      <p class="meta">IT &amp; ethical hacking, hands-on.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FENRIR / CONTACT BAND ================= -->
+<section class="band fenrir">
+  <div class="wrap band-grid">
+    <div class="reveal">
+      <svg class="chain" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+        <path d="M9.5 13.5 7 16a3.5 3.5 0 0 1-5-5l2.4-2.4"/>
+        <path d="M14.5 10.5 17 8a3.5 3.5 0 0 1 5 5l-1.6 1.6"/>
+        <path d="M10 7.5V4M14 16.5V20M6.5 11H3M21 13h-3.5"/>
+      </svg>
+      <span class="eyebrow">From the workshop</span>
+      <h2>Made in-house at fenrir.pro.</h2>
+      <p>
+        We build xterm.rs and run it across our own security training and tooling.
+        Want a real terminal inside your product, or a hand getting it deployed and
+        locked down? We're happy to help.
+      </p>
+    </div>
+    <div class="aside reveal" style="transition-delay:.08s">
+      <a class="btn btn-primary" href="https://fenrir.pro/contact" target="_blank" rel="noopener">Contact fenrir.pro ↗</a>
+      <p class="meta">fenrir.pro/contact · enquiries &amp; support</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FOOTER ================= -->
+<footer>
+  <div class="wrap foot-grid">
+    <div>
+      <div class="brand" style="margin-bottom:.6rem">fenrir<span class="glyph">.</span>pro <small>// xterm.rs</small></div>
+      <p class="foot-note">Demo deployment. These terminals hand out a real shell — add authentication, restrict egress and put it behind a proxy before exposing it on the open internet.</p>
+    </div>
+    <nav class="foot-links">
+      <a href="https://fenrir.pro/contact" target="_blank" rel="noopener">Contact</a>
+      <a href="https://hack.courses" target="_blank" rel="noopener">hack.courses</a>
+      <a href="#features">Features</a>
+      <a href="#demos">Demos</a>
+    </nav>
+  </div>
+  <div class="wrap" style="margin-top:34px;font-family:var(--mono);font-size:.74rem;color:var(--ink-faint)">© 2026 fenrir.pro — xterm.rs</div>
+</footer>
+
+<script>
+  // The terminal back-ends are published on their own ports next to this page,
+  // so they work whether you open the site on localhost or a server's address.
+  // The path must contain "term" — the served page rewrites it to "/ws".
+  const PORTS = { shell: 8081, htop: 8082, vim: 8083 };
+
+  function termUrl(name){
+    const scheme = location.protocol === 'https:' ? 'https:' : 'http:';
+    return scheme + '//' + location.hostname + ':' + PORTS[name] + '/term';
+  }
+
+  // Hero shell loads immediately.
+  document.querySelector('iframe[data-term="shell"]').src = termUrl('shell');
+
+  // Demo tabs: lazy-load each back-end the first time it's opened, so we don't
+  // hold three live shells open at once.
+  const frame   = document.getElementById('demo-frame');
+  const title   = document.getElementById('demo-title');
+  const foot     = document.getElementById('demo-foot');
+  const loaded  = {};
+  const META = {
+    shell: { title:'<b>demo@fenrir</b>:~ — bash',         foot:'a real bash shell — your keystrokes hit the process directly' },
+    htop:  { title:'<b>demo@fenrir</b>:~ — htop',         foot:'a live TUI — resize the window to fire a SIGWINCH' },
+    vim:   { title:'<b>demo@fenrir</b>:~ — vim welcome.txt', foot:'a real editor — :q! to quit' }
+  };
+
+  function show(name){
+    document.querySelectorAll('.tab').forEach(t =>
+      t.setAttribute('aria-selected', t.dataset.demo === name));
+    document.querySelectorAll('.demo-cap').forEach(c =>
+      c.classList.toggle('active', c.dataset.cap === name));
+    title.innerHTML = META[name].title;
+    foot.textContent = META[name].foot;
+    if (!loaded[name]) { frame.src = termUrl(name); loaded[name] = true; }
+  }
+
+  document.querySelectorAll('.tab').forEach(t =>
+    t.addEventListener('click', () => show(t.dataset.demo)));
+
+  show('shell'); // first demo on by default
+
+  // Scroll reveal.
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); } });
+  }, { threshold:.14 });
+  document.querySelectorAll('.reveal:not(.in)').forEach(el => io.observe(el));
+</script>
+</body>
+</html>

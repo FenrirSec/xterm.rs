@@ -1,0 +1,61 @@
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./web/index.html:/usr/share/nginx/html/index.html:ro
+    depends_on:
+      - term-shell
+      - term-htop
+      - term-vim
+    restart: unless-stopped
+
+  term-shell:
+    build: ./server
+    command: ["--cmd", "bash -i"]
+    ports:
+      - "8081:8080"
+    init: true
+    user: demo
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    restart: unless-stopped
+
+  term-htop:
+    build: ./server
+    command: ["--cmd", "htop"]
+    ports:
+      - "8082:8080"
+    init: true
+    user: demo
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    depends_on:
+      - term-shell
+    restart: unless-stopped
+
+  term-vim:
+    build: ./server
+    command: ["--cmd", "vim /etc/fenrir/welcome.txt"]
+    ports:
+      - "8083:8080"
+    init: true
+    user: demo
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    depends_on:
+      - term-shell
+    restart: unless-stopped

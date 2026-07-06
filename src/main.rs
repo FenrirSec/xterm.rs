@@ -5,16 +5,14 @@ use hyper::service::{make_service_fn, service_fn};
 use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 use nix::pty::openpty;
-use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, cfmakeraw};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::process::{Stdio};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use tokio::process::Command;
 use std::convert::Infallible;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde::Deserialize;
 use log::info;
-use nix::unistd::{setsid, dup, getsid};
+use nix::unistd::dup;
 use structopt::StructOpt;
 use tokio::sync::broadcast;
 
@@ -57,23 +55,23 @@ async fn handle_websocket(
     info!("WebSocket connection established");
     let (mut ws_sender, mut ws_receiver) = stream.split();
 
-    // Create a PTY.
-    let pty = openpty(None, None)?;
+    // Create a PTY. Seed it with a sane 80x24 default so anything that spawns a
+    // full-screen program before the client's first resize message lands does
+    // not start at 0x0. The real size still arrives from the browser on connect.
+    let winsize = nix::pty::Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&winsize), None)?;
     let master_fd = pty.master.as_raw_fd();
     let slave_fd = pty.slave.as_raw_fd();
     info!("PTY created (master: {}, slave: {})", master_fd, slave_fd);
 
-    // Configure the PTY on the slave side.
-    let mut termios = tcgetattr(slave_fd)?;
-    cfmakeraw(&mut termios);
-
-    // Re-enable echoing of input characters.
-    use nix::sys::termios::LocalFlags;
-    termios.local_flags |= LocalFlags::ECHO;
-
-    // Apply the updated terminal settings.
-    tcsetattr(slave_fd, SetArg::TCSANOW, &termios)?;
-    info!("PTY (slave) configured in raw mode with ECHO enabled");
+    // Leave the slave in its default cooked mode. Bash/readline configure the
+    // line discipline themselves; forcing raw mode here would clear ISIG and
+    // turn Ctrl-C into a literal byte instead of a SIGINT.
 
     // Set master to non-blocking mode.
     let flags = fcntl(master_fd, FcntlArg::F_GETFL)?;
@@ -85,22 +83,46 @@ async fn handle_websocket(
     let cmd_name = cmd_parts.next().unwrap_or("bash");
     let cmd_args: Vec<&str> = cmd_parts.collect();
 
-    // Spawn the specified command.
-    let slave_stdin = unsafe { Stdio::from_raw_fd(slave_fd) };
-    let slave_stdout = unsafe { Stdio::from_raw_fd(slave_fd) };
-    let slave_stderr = unsafe { Stdio::from_raw_fd(slave_fd) };
+    // Build the child. All controlling-terminal setup happens in the pre_exec
+    // hook, which runs in the forked child before exec. Keep it strictly
+    // async-signal-safe: raw syscalls only, no allocation, no locks. This is
+    // what `python3 -c 'pty.spawn(...)'` was doing for you.
+    let mut command = Command::new(cmd_name);
+    command.args(cmd_args).env("TERM", "xterm-256color");
 
-    let child = Command::new(cmd_name)
-        .args(cmd_args)
-        .env("TERM", "xterm-256color")
-        .stdin(slave_stdin)
-        .stdout(slave_stdout)
-        .stderr(slave_stderr)
-        .spawn()?;
+    unsafe {
+        command.pre_exec(move || {
+            // New session => session leader with no controlling terminal.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Claim the slave PTY as this session's controlling terminal.
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Wire stdin/stdout/stderr to the slave.
+            if libc::dup2(slave_fd, libc::STDIN_FILENO) == -1
+                || libc::dup2(slave_fd, libc::STDOUT_FILENO) == -1
+                || libc::dup2(slave_fd, libc::STDERR_FILENO) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Drop the raw fds the child no longer needs.
+            if slave_fd > libc::STDERR_FILENO {
+                libc::close(slave_fd);
+            }
+            libc::close(master_fd);
+            Ok(())
+        });
+    }
 
+    let child = command.spawn()?;
+    let child_pid = child.id().expect("Child process should have a PID") as i32;
+    info!("Spawned '{}' with PID {}", cmd_name, child_pid);
 
-        let child_pid = child.id()
-        .expect("Child process should have a PID") as i32;  // Convert u32 to i32
+    // The parent must release the slave end, otherwise the master never sees
+    // EOF when the shell exits.
+    drop(pty.slave);
 
     if exit_with_process {
         if let Some(sender) = &shutdown_sender {
@@ -113,20 +135,13 @@ async fn handle_websocket(
         }
     }
 
-    // Check if the process is already a session leader.
-    if getsid(None).is_err() {
-        if let Err(e) = setsid() {
-            eprintln!("Failed to set session leader: {}", e);
-            return Err(Box::new(e));
-        }
-    }
-
-    // Duplicate the PTY master file descriptor.
-    let master_fd_dup = dup(pty.master.as_raw_fd())?;
-
-    // Create separate file handles for reading and writing.
-    let master_file_reader = unsafe { std::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
-    let master_file_writer = unsafe { std::fs::File::from_raw_fd(master_fd_dup) };
+    // Take sole ownership of the master fd, then build separate read/write
+    // handles. into_raw_fd stops the OwnedFd and the File from both closing
+    // the same descriptor.
+    let master_raw = pty.master.into_raw_fd();
+    let read_fd = dup(master_raw)?;
+    let master_file_reader = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let master_file_writer = unsafe { std::fs::File::from_raw_fd(master_raw) };
 
     // Wrap the files in async I/O wrappers.
     let mut pty_reader = tokio::io::BufReader::new(tokio::fs::File::from_std(master_file_reader));
@@ -294,9 +309,9 @@ async fn handle_request(
         <!DOCTYPE html>
         <html>
         <head>
-            <link rel="stylesheet" href="https://unpkg.com/xterm@5.1.0/css/xterm.css">
-            <script src="https://unpkg.com/xterm@5.1.0/lib/xterm.js"></script>
-            <script src="https://unpkg.com/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
+            <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
+            <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
+            <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
         </head>
         <body>
             <style>
@@ -318,6 +333,24 @@ async fn handle_request(
                 term.loadAddon(fitAddon);
                 let ws = null;
                 let interval;
+                let ro = null;
+                const el = document.getElementById('terminal');
+
+                // Report the *current* terminal size to the server. Sent
+                // explicitly (not just via onResize) because fit() only emits
+                // onResize when dimensions actually change, which usually does
+                // not happen on the first connect.
+                function sendSize() {{
+                    if (ws && ws.readyState === WebSocket.OPEN) {{
+                        ws.send(JSON.stringify({{ cols: term.cols, rows: term.rows }}));
+                    }}
+                }}
+
+                // Measure the container, resize the terminal, then report.
+                function fitAndSend() {{
+                    try {{ fitAddon.fit(); }} catch (e) {{}}
+                    sendSize();
+                }}
 
                 function connect() {{
                     console.log('Connecting to WebSocket...');
@@ -327,15 +360,22 @@ async fn handle_request(
                     ws.onopen = () => {{
                         console.log('WebSocket connected');
                         term.reset();
-                        fitAddon.fit();
-                        term.focus();
-                        interval = setInterval(() => ws.send(''), 300)
+                        // Wait for web-font metrics (no-op with plain monospace),
+                        // then let layout settle one frame before measuring so
+                        // the iframe has reached its final size.
+                        const settle = document.fonts ? document.fonts.ready : Promise.resolve();
+                        settle.then(() => requestAnimationFrame(() => {{
+                            fitAndSend();
+                            term.focus();
+                        }}));
+                        interval = setInterval(() => ws.send(''), 300);
                     }};
                     ws.onerror = (error) => {{
                         console.error('WebSocket error:', error);
                     }};
                     ws.onclose = () => {{
                         console.log('WebSocket closed');
+                        clearInterval(interval);
                     }};
                     ws.onmessage = (event) => {{
                         let text;
@@ -347,32 +387,49 @@ async fn handle_request(
                         term.write(text);
                     }};
                 }}
+
                 term.onData(data => {{
                     if (ws && ws.readyState === WebSocket.OPEN) {{
-                        if (data === "\x03" || data === "\x04") {{
-                            ws.send(new TextEncoder().encode(data));
-                        }} else {{
-                            ws.send(new TextEncoder().encode(data));
-                        }}
+                        ws.send(new TextEncoder().encode(data));
                     }}
                 }});
-                term.onResize(({{ cols, rows }}) => {{
-                    if (ws && ws.readyState === WebSocket.OPEN) {{
-                        ws.send(JSON.stringify({{ cols, rows }}));
-                    }}
-                }});
+
+                // Fires when fit() (or anything) actually changes dimensions.
+                term.onResize(() => sendSize());
+
+                // Manual fallback via the `resize` escape-sequence round-trip.
+                // No longer needed, kept for convenience/debugging.
                 function resize() {{
                     setTimeout(() => {{
                         if (ws && ws.readyState === WebSocket.OPEN) {{
                             ws.send(new TextEncoder().encode("resize\n"));
                         }}
-                    }}, 200)
+                    }}, 200);
                 }}
 
-                term.open(document.getElementById('terminal'));
-                fitAddon.fit();
+                term.open(el);
+
+                // Android/Gboard input hardening. Some soft keyboards honor
+                // these and stop injecting predictive/duplicated input.
+                const ta = document.querySelector('.xterm-helper-textarea');
+                if (ta) {{
+                    ta.setAttribute('autocomplete', 'off');
+                    ta.setAttribute('autocorrect', 'off');
+                    ta.setAttribute('autocapitalize', 'none');
+                    ta.setAttribute('spellcheck', 'false');
+                }}
+
+                // The core fix: re-measure whenever the container's real size
+                // changes. This fires when the injected iframe finally settles,
+                // when the challenge wrapper flips from display:none to visible,
+                // and on window resize -- so even if the first fit runs too
+                // early at the wrong size, the next one corrects it and reports
+                // the right dimensions to the PTY.
+                ro = new ResizeObserver(() => fitAndSend());
+                ro.observe(el);
+
                 connect();
-                window.addEventListener('resize', () => fitAddon.fit());
+                window.addEventListener('resize', () => fitAndSend());
             </script>
         </body>
         </html>

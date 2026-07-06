@@ -1,0 +1,28 @@
+  ┌─────────────────────────────────────────────────────────────┐
+  │  You are inside vim — running in a browser tab, over xterm.rs │
+  └─────────────────────────────────────────────────────────────┘
+
+  This is not a recording and not a fake. It is a real vim process,
+  attached to a real PTY with a real controlling terminal. That is the
+  whole point of xterm.rs.
+
+  Try it:
+
+    • Arrow keys / hjkl    move around
+    • i                    enter insert mode and type
+    • Esc  then  :q!       quit without saving
+    • :help               open vim's own help (a TUI inside a TUI)
+    • Resize this window   vim reflows — that's a live SIGWINCH
+
+  Full-screen, cursor-addressed programs like this only work when the
+  shell underneath has a proper controlling terminal. Most "web
+  terminals" don't give you one. xterm.rs does.
+
+  ─────────────────────────────────────────────────────────────────
+
+  xterm.rs is built in-house at fenrir.pro and powers every lab on
+  hack.courses, where IT and ethical-hacking lessons run on real
+  machines in the browser.
+
+      Learn:    https://hack.courses
+      Enquiries / deployment help:  https://fenrir.pro/contact

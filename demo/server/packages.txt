@@ -1,0 +1,1 @@
+snort iptables tcpdump yara binutils gdb lsof strace file findutils diffutils grep gawk iproute2 openssl xxd coreutils emacs-nox vim ruby radare2 curl py3-pip suricata tmux tshark py3-pycryptodome jq nmap nmap-scripts
