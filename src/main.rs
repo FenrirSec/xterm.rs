@@ -309,9 +309,9 @@ async fn handle_request(
         <!DOCTYPE html>
         <html>
         <head>
-            <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
-            <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
-            <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+            <link rel="stylesheet" href="https://unpkg.com/@xterm/xterm/css/xterm.css">
+            <script src="https://unpkg.com/@xterm/xterm/lib/xterm.js"></script>
+            <script src="https://unpkg.com/@xterm/addon-fit/lib/addon-fit.js"></script>
         </head>
         <body>
             <style>
@@ -329,7 +329,12 @@ async fn handle_request(
                     theme: {{ background: '#111314', foreground: '#ffffff' }},
                     convertEol: true,
                 }});
-                const fitAddon = new FitAddon.FitAddon();
+                // @xterm/addon-fit exposes FitAddon.FitAddon; fall back to a
+                // bare FitAddon global just in case the build shape differs.
+                const FitAddonCtor = (window.FitAddon && window.FitAddon.FitAddon)
+                    ? window.FitAddon.FitAddon
+                    : window.FitAddon;
+                const fitAddon = new FitAddonCtor();
                 term.loadAddon(fitAddon);
                 let ws = null;
                 let interval;
