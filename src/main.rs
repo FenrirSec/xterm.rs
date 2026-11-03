@@ -38,6 +38,36 @@ struct Opt {
     /// Exit the program when the PTY process closes or when CTRL+D is received
     #[structopt(long)]
     exit_with_process: bool,
+
+    /// Directory to append per-connection keystroke audit logs to. Omit to
+    /// disable. Each WebSocket connection gets its own timestamped file holding
+    /// everything the user typed. Logged in the server, so a user cannot turn it
+    /// off from inside the shell.
+    #[structopt(long)]
+    log_dir: Option<String>,
+
+    /// Label written into each log's name and header so the admin can tell
+    /// whose session it is (e.g. the user or session id). Falls back to the
+    /// HC_SESSION_ID environment variable when not given.
+    #[structopt(long)]
+    label: Option<String>,
+
+    /// Stream keystrokes to the store over WebSocket instead of (or as well as)
+    /// a log file, e.g. wss://store/internal/termlog or
+    /// ws://store:5000/internal/termlog. Best-effort: if the store is
+    /// unreachable the terminal keeps working.
+    #[structopt(long)]
+    log_ws_url: Option<String>,
+
+    /// Shared secret sent as ?token= on the log WebSocket. Must match the
+    /// store's TERMLOG_TOKEN.
+    #[structopt(long)]
+    log_ws_token: Option<String>,
+
+    /// Accept a self-signed / internal TLS certificate on the log WebSocket
+    /// (wss). Use when the store presents an internal cert on the docker net.
+    #[structopt(long)]
+    log_ws_insecure: bool,
 }
 
 #[derive(Deserialize)]
@@ -46,12 +76,103 @@ struct ResizeMessage {
     cols: u16,
 }
 
+/// Stream keystrokes to the store over WebSocket. Best-effort: any failure
+/// logs and returns, which drops the receiver so the terminal's send side just
+/// no-ops. Never blocks or kills the terminal.
+async fn ws_logger(
+    url: String,
+    token: Option<String>,
+    insecure: bool,
+    user: String,
+    pid: i32,
+    cmd: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u128, String)>,
+) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let full_url = match token {
+        Some(ref t) if !t.is_empty() => {
+            if url.contains('?') { format!("{}&token={}", url, t) } else { format!("{}?token={}", url, t) }
+        }
+        _ => url.clone(),
+    };
+
+    // wss:// support is opt-in via the `wss` cargo feature, so the default
+    // build needs no TLS crate and compiles unchanged. With the feature on,
+    // --log-ws-insecure accepts a self-signed/internal cert.
+    let connect_res = {
+        #[cfg(feature = "wss")]
+        {
+            if insecure && full_url.starts_with("wss") {
+                match native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .danger_accept_invalid_hostnames(true)
+                    .build()
+                {
+                    Ok(tls) => {
+                        let connector = tokio_tungstenite::Connector::NativeTls(tls);
+                        tokio_tungstenite::connect_async_tls_with_config(full_url.as_str(), None, false, Some(connector)).await
+                    }
+                    Err(e) => {
+                        eprintln!("termlog: TLS setup failed: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                tokio_tungstenite::connect_async(full_url.as_str()).await
+            }
+        }
+        #[cfg(not(feature = "wss"))]
+        {
+            if full_url.starts_with("wss") {
+                eprintln!("termlog: wss:// needs the `wss` cargo feature; \
+                           build with --features wss, or use ws:// (TLS at your proxy)");
+            }
+            let _ = insecure;
+            tokio_tungstenite::connect_async(full_url.as_str()).await
+        }
+    };
+
+    let (mut ws, _resp) = match connect_res {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("termlog: connect to store failed: {}", e);
+            return;
+        }
+    };
+
+    let hello = serde_json::json!({
+        "type": "hello", "user": user, "pid": pid.to_string(), "cmd": cmd
+    }).to_string();
+    if ws.send(Message::Text(hello)).await.is_err() {
+        return;
+    }
+    info!("termlog: streaming to store");
+
+    while let Some((t, data)) = rx.recv().await {
+        let frame = serde_json::json!({
+            "type": "input", "t": t as u64, "data": data
+        }).to_string();
+        if ws.send(Message::Text(frame)).await.is_err() {
+            break;
+        }
+    }
+    let _ = ws.close(None).await;
+}
+
 async fn handle_websocket(
     stream: WebSocketStream<hyper::upgrade::Upgraded>,
     cmd: String,
     exit_with_process: bool,
     shutdown_sender: Option<broadcast::Sender<()>>,
+    log_dir: Option<String>,
+    label: Option<String>,
+    log_ws_url: Option<String>,
+    log_ws_token: Option<String>,
+    log_ws_insecure: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write as _;        // writeln! on the std log File
     info!("WebSocket connection established");
     let (mut ws_sender, mut ws_receiver) = stream.split();
 
@@ -79,6 +200,7 @@ async fn handle_websocket(
     fcntl(master_fd, FcntlArg::F_SETFL(new_flags))?;
 
     // Parse the command and its arguments.
+    let cmd_for_log = cmd.clone();
     let mut cmd_parts = cmd.split_whitespace();
     let cmd_name = cmd_parts.next().unwrap_or("bash");
     let cmd_args: Vec<&str> = cmd_parts.collect();
@@ -123,6 +245,58 @@ async fn handle_websocket(
     // The parent must release the slave end, otherwise the master never sees
     // EOF when the shell exits.
     drop(pty.slave);
+
+    // Optional keystroke audit log: one file per connection. Everything the
+    // user sends is appended as a timestamped, escaped line. It lives here in
+    // the server rather than in the shell, so it cannot be disabled from inside
+    // bash. Note: this captures *all* input, including anything typed at a
+    // password prompt.
+    let mut input_log: Option<std::fs::File> = None;
+    if let Some(dir) = log_dir.as_deref() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Who this session belongs to: --label, else HC_SESSION_ID, else blank.
+        let raw_label = label.clone()
+            .or_else(|| std::env::var("HC_SESSION_ID").ok())
+            .unwrap_or_default();
+        // Keep the label filesystem-safe (it becomes part of the file name).
+        let safe_label: String = raw_label.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+            .take(64)
+            .collect();
+        let path = if safe_label.is_empty() {
+            format!("{}/session-{}-{}.log", dir, child_pid, ts)
+        } else {
+            format!("{}/session-{}-{}-{}.log", dir, safe_label, child_pid, ts)
+        };
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "# start pid={} ts={} user={:?} cmd={:?}",
+                                 child_pid, ts, raw_label, cmd_for_log);
+                let _ = f.flush();
+                info!("Keystroke log: {}", path);
+                input_log = Some(f);
+            }
+            Err(e) => eprintln!("Keystroke log: cannot open {}: {}", path, e),
+        }
+    }
+
+    // Optional: stream keystrokes to the store over WebSocket. Spawned as a
+    // detached task so a slow or down store never blocks the terminal.
+    let log_tx: Option<tokio::sync::mpsc::UnboundedSender<(u128, String)>> =
+        if let Some(url) = log_ws_url {
+            let user = label.clone()
+                .or_else(|| std::env::var("HC_SESSION_ID").ok())
+                .unwrap_or_default();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u128, String)>();
+            tokio::spawn(ws_logger(url, log_ws_token, log_ws_insecure,
+                                   user, child_pid, cmd_for_log.clone(), rx));
+            Some(tx)
+        } else {
+            None
+        };
 
     if exit_with_process {
         if let Some(sender) = &shutdown_sender {
@@ -193,6 +367,22 @@ async fn handle_websocket(
                     }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
+                    // Audit everything the user typed, before any filtering, so
+                    // the record is faithful (Ctrl-D, escape sequences and all).
+                    if input_log.is_some() || log_tx.is_some() {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        if let Some(f) = input_log.as_mut() {
+                            let _ = writeln!(f, "{}\t{:?}", ts, String::from_utf8_lossy(&data));
+                            let _ = f.flush();
+                        }
+                        if let Some(tx) = log_tx.as_ref() {
+                            let _ = tx.send((ts, String::from_utf8_lossy(&data).to_string()));
+                        }
+                    }
+
                     if exit_with_process && data.contains(&0x04) {
                         if let Some(sender) = &shutdown_sender {
                             let _ = sender.send(());
@@ -249,6 +439,11 @@ async fn handle_request(
     cmd: String,
     exit_with_process: bool,
     shutdown_sender: Option<broadcast::Sender<()>>,
+    log_dir: Option<String>,
+    label: Option<String>,
+    log_ws_url: Option<String>,
+    log_ws_token: Option<String>,
+    log_ws_insecure: bool,
 ) -> Result<Response<Body>, Infallible> {
     info!("Received request: {} {}", req.method(), req.uri().path());
 
@@ -289,7 +484,7 @@ async fn handle_request(
                 Ok(upgraded) => {
                     info!("Connection upgraded");
                     let ws_stream = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
-                    if let Err(e) = handle_websocket(ws_stream, cmd, exit_with_process, shutdown_sender).await {
+                    if let Err(e) = handle_websocket(ws_stream, cmd, exit_with_process, shutdown_sender, log_dir, label, log_ws_url, log_ws_token, log_ws_insecure).await {
                         eprintln!("WebSocket handling error: {}", e);
                     }
                 }
@@ -456,6 +651,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let https = opt.https;
         let cmd = opt.cmd.clone();
         let exit_with_process = opt.exit_with_process;
+        let log_dir = opt.log_dir.clone();
+        let label = opt.label.clone();
+        let log_ws_url = opt.log_ws_url.clone();
+        let log_ws_token = opt.log_ws_token.clone();
+        let log_ws_insecure = opt.log_ws_insecure;
         let shutdown_sender = if exit_with_process {
             Some(shutdown_sender.clone())
         } else {
@@ -463,7 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(req, https, cmd.clone(), exit_with_process, shutdown_sender.clone())
+                handle_request(req, https, cmd.clone(), exit_with_process, shutdown_sender.clone(), log_dir.clone(), label.clone(), log_ws_url.clone(), log_ws_token.clone(), log_ws_insecure)
             }))
         }
     });
