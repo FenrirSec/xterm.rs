@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 200" width="760" height="200" role="img" aria-label="xterm.rs">
+  <defs>
+    <linearGradient id="iris" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5a62e6"/>
+      <stop offset="1" stop-color="#454ade"/>
+    </linearGradient>
+  </defs>
+
+  <!-- self-contained dark card: reads on light and dark GitHub themes -->
+  <rect x="2" y="2" width="756" height="196" rx="26" fill="#17181a"/>
+  <rect x="2.5" y="2.5" width="755" height="195" rx="25.5" fill="none" stroke="#454ade" stroke-opacity="0.28"/>
+
+  <!-- terminal mark -->
+  <g>
+    <rect x="40" y="44" width="116" height="112" rx="20" fill="#0f1012" stroke="#2b2d31" stroke-width="2"/>
+    <!-- title dots -->
+    <circle cx="66" cy="68" r="5.5" fill="#fb6376"/>
+    <circle cx="86" cy="68" r="5.5" fill="url(#iris)"/>
+    <circle cx="106" cy="68" r="5.5" fill="#3a3d42"/>
+    <!-- prompt chevron -->
+    <polyline points="66,104 88,122 66,140" fill="none" stroke="url(#iris)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- cursor block -->
+    <rect x="98" y="131" width="28" height="10" rx="2.5" fill="#fb6376"/>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="'Open Sans','Segoe UI',Helvetica,Arial,sans-serif">
+    <text x="206" y="118" font-size="74" font-weight="700" letter-spacing="-1" fill="#f5f6f7">xterm<tspan fill="#fb6376">.rs</tspan></text>
+    <text x="210" y="156" font-size="21" font-weight="400" letter-spacing="0.2" fill="#9aa0a6">A real PTY, streamed over a WebSocket.</text>
+  </g>
+</svg>

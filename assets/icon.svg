@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160" role="img" aria-label="xterm.rs icon">
+  <defs>
+    <linearGradient id="iris" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5a62e6"/>
+      <stop offset="1" stop-color="#454ade"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="144" height="144" rx="34" fill="#17181a"/>
+  <rect x="8.5" y="8.5" width="143" height="143" rx="33.5" fill="none" stroke="#454ade" stroke-opacity="0.30"/>
+
+  <rect x="32" y="36" width="96" height="88" rx="18" fill="#0f1012" stroke="#2b2d31" stroke-width="2"/>
+  <circle cx="54" cy="58" r="5" fill="#fb6376"/>
+  <circle cx="72" cy="58" r="5" fill="url(#iris)"/>
+  <circle cx="90" cy="58" r="5" fill="#3a3d42"/>
+  <polyline points="54,88 74,103 54,118" fill="none" stroke="url(#iris)" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="84" y="110" width="24" height="9" rx="2.5" fill="#fb6376"/>
+</svg>
