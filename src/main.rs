@@ -414,6 +414,16 @@ async fn handle_request(
 
                 term.open(el);
 
+                // US / QWERTY-International dead keys ( apostrophe, quote,
+                // backtick, tilde, caret ): let the browser compose them
+                // instead of xterm handling the raw keydown, so the composed
+                // character (a straight quote, etc.) arrives via the
+                // composition/input path rather than as a spacing accent.
+                term.attachCustomKeyEventHandler((e) => {{
+                    if (e.type === 'keydown' && (e.key === 'Dead' || e.isComposing || e.keyCode === 229)) return false;
+                    return true;
+                }});
+
                 // Android/Gboard input hardening. Some soft keyboards honor
                 // these and stop injecting predictive/duplicated input.
                 const ta = document.querySelector('.xterm-helper-textarea');
