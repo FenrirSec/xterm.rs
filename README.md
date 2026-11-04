@@ -174,10 +174,6 @@ machine in a browser tab, powered by `xterm_rs`. No VMs to install, nothing to
 configure. Learners land in a working terminal and start breaking, and fixing,
 things from the first minute.
 
-Want a real terminal inside your product, or a hand getting it deployed and locked
-down? We run this across our own security training and tooling and we are happy to
-help: [fenrir.pro/contact](https://fenrir.pro/contact).
-
 ---
 
 <sub>Made in-house at <a href="https://fenrir.pro">fenrir.pro</a>. © 2026 fenrir.pro</sub>
